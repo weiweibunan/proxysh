@@ -17,7 +17,7 @@ export AGSBX_STATE_DIR="$test_dir/state"
 mkdir -p "$AGSBX_STATE_DIR" "$test_dir/fixtures"
 
 cat > "$test_dir/fixtures/openai.json" <<'JSON'
-{"version":3,"rules":[{"domain":["api.openai.com"],"domain_suffix":["openai.com","chatgpt.com"],"domain_keyword":["openai-fixture"],"domain_regex":["^chat[0-9]+\\.openai\\.com$"]}]}
+{"version":3,"rules":[{"domain":["api.openai.com"],"domain_suffix":["openai.com","chatgpt.com",".subonly.example",".literal+suffix.example"],"domain_keyword":["openai-fixture"],"domain_regex":["^chat[0-9]+\\.openai\\.com$"]}]}
 JSON
 cat > "$test_dir/fixtures/google-gemini.json" <<'JSON'
 {"version":3,"rules":[{"domain":["generativelanguage.googleapis.com"],"domain_suffix":["gemini.google.com"],"domain_regex":["^gemini-[a-z]+\\.google\\.com$"]}]}
@@ -112,6 +112,9 @@ assert_json 'sing-box preserves inbound settings' '.inbounds[0].tag == "fixture-
 assert_json 'sing-box has exactly one WARP endpoint' '[.endpoints[]? | select(.tag == "warp-out")] | length == 1' "$test_dir/sb.json"
 assert_json 'Xray routes exact OpenAI domains through WARP' 'any(.routing.rules[]; .outboundTag == "warp-out" and (.domain | index("full:api.openai.com")) != null)' "$test_dir/xr.json"
 assert_json 'Xray preserves domain suffix match semantics' 'any(.routing.rules[]; .outboundTag == "warp-out" and (.domain | index("domain:openai.com")) != null and (.domain | index("domain:gemini.google.com")) != null)' "$test_dir/xr.json"
+assert_json 'Xray preserves leading-dot suffix without including apex' '.routing.rules[0].domain | index("regexp:\\.subonly\\.example$") != null and index("domain:subonly.example") == null' "$test_dir/xr.json"
+assert_json 'Xray leading-dot conversion escapes regex metacharacters' '.routing.rules[0].domain | index("regexp:\\.literal\\+suffix\\.example$") != null' "$test_dir/xr.json"
+assert_json 'Xray route-only sniffing preserves original destination' 'all(.inbounds[]; .sniffing.enabled and .sniffing.routeOnly == true)' "$test_dir/xr.json"
 assert_json 'Xray preserves regular expression match semantics' 'any(.routing.rules[]; .outboundTag == "warp-out" and (.domain | index("regexp:^chat[0-9]+\\.openai\\.com$")) != null)' "$test_dir/xr.json"
 assert_json 'Xray has no WARP catch-all and keeps direct first' '.outbounds[0].tag == "direct" and all(.routing.rules[] | select(.outboundTag == "warp-out"); (.domain | length) > 0 and (.ip? == null))' "$test_dir/xr.json"
 assert_json 'Xray preserves inbound settings and enables sniffing' '.inbounds[0].tag == "fixture-inbound" and .inbounds[0].port == 19081 and .inbounds[0].sniffing.enabled == true' "$test_dir/xr.json"

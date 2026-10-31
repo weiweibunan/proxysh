@@ -8,7 +8,7 @@
 AGSBX_REPO=weiweibunan/proxysh
 AGSBX_REF=main
 AGSBX_URL="https://raw.githubusercontent.com/$AGSBX_REPO/$AGSBX_REF/argosbx.sh"
-AGSBX_VERSION=2026.10.31
+AGSBX_VERSION=2026.10.31-r2
 umask 077
 
 agsbx_usage() {
@@ -307,6 +307,16 @@ agsbx_update_rules() {
     done
     # Reject future unsupported match conditions to avoid accidentally broadening a rule.
     jq -es '
+      # Xray domain: includes the apex, unlike a sing-box suffix starting with a dot.
+      # Escape regex metacharacters literally when preserving that subdomains-only case.
+      def regex_literal:
+        explode | map(. as $c |
+          if ([92,46,94,36,124,63,42,43,40,41,91,93,123,125] | index($c)) != null
+          then "\\" + ([$c] | implode) else ([$c] | implode) end) | join("");
+      def xray_suffix:
+        if startswith(".") then
+          if length > 1 then "regexp:" + regex_literal + "$" else error("empty suffix") end
+        else "domain:" + . end;
       def arr:
         (if . == null then [] elif type == "array" then . elif type == "string" then [.] else error("invalid domain list") end) |
         if all(.[]; type == "string" and length > 0 and (test("[\\r\\n\\t]") | not)) then . else error("empty or invalid domain") end;
@@ -314,7 +324,7 @@ agsbx_update_rules() {
           type == "object" and ((keys - ["domain","domain_suffix","domain_keyword","domain_regex"]) | length == 0)))
       then [ .[].rules[] |
         ((.domain | arr)[] | "full:" + .),
-        ((.domain_suffix | arr)[] | ltrimstr(".") | if length > 0 then "domain:" + . else error("empty suffix") end),
+        ((.domain_suffix | arr)[] | xray_suffix),
         ((.domain_keyword | arr)[] | "keyword:" + .),
         ((.domain_regex | arr)[] | "regexp:" + .)
       ] | unique | if length > 0 then . else error("empty domain set") end
@@ -340,6 +350,7 @@ agsbx_apply_routing() {
         fi
         jq --slurpfile wp "$state/warp.json" --slurpfile domains "$state/xray-ai-domains.json" '
           $wp[0] as $w |
+          # Sniffed names select the route; routeOnly preserves an original IP target.
           .inbounds |= map(.sniffing = {enabled:true,destOverride:["http","tls","quic"],metadataOnly:false,routeOnly:true}) |
           .outbounds = [{protocol:"freedom",tag:"direct",settings:{}},
             (if $w.mode == "socks" then

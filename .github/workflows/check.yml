@@ -21,3 +21,16 @@ jobs:
         run: |
           bash tests/test-routing.sh
           bash tests/test-releases.sh
+      - name: Verify real core routing on loopback
+        env:
+          XRAY_VERSION: 26.10.29
+          SINGBOX_VERSION: 1.14.4
+        run: |
+          export AGSBX_STATE_DIR="$RUNNER_TEMP/argosbx-cores" cpu=amd64
+          source lib/releases.sh
+          upxray
+          upsingbox
+          node tests/test-routing-behavior.cjs \
+            --xray "$AGSBX_STATE_DIR/xray" \
+            --singbox "$AGSBX_STATE_DIR/sing-box" \
+            --temp-root "$RUNNER_TEMP"

@@ -2,10 +2,24 @@
 
 基于 [yonggekkk/argosbx](https://github.com/yonggekkk/argosbx) 的协议兼容层重构。保留原安装变量、节点链接和订阅生成，增加服务端 AI 域名分流及官方稳定版内核更新。GPL-3.0，保留上游署名及许可证。
 
-- **sing-box**：OpenAI、Gemini 使用 MetaCubeX 远程二进制规则集，`http_client: {}`，每 `1d` 更新。匹配规则先于通用解析，目标通过 WARP 解析及连接。
+- **sing-box**：OpenAI、Gemini 使用 MetaCubeX 远程二进制规则集，`http_client: {}`，每 `1d` 更新。AI 规则先于通用解析，命中后使用 WARP 出口。
 - **Xray**：读取相同规则源的 JSON，将精确域名、后缀、关键字和正则转换为 Xray 规则；每天刷新。未匹配流量使用 direct。
 - **组件更新**：安装及更新时动态查询 SagerNet/sing-box、XTLS/Xray-core、cloudflare/cloudflared 官方最新稳定发布，排除预发布版本。下载后校验官方 GitHub SHA256 摘要，检查二进制版本和配置后才替换。
 - **WARP 凭据**：读取服务器已有的 WireGuard 配置，或使用已有 WARP SOCKS 服务。没有共享密钥，不自动注册账号。凭据只保存在服务器，不上传 GitHub。
+
+## 两个内核的实现区别
+
+| 项目 | sing-box | Xray |
+| --- | --- | --- |
+| 域名规则 | `route.rule_set` 远程 `.srs` | 从同源 `.json` 转成 `routing.rules[].domain`，不读取 `.srs` |
+| WARP WireGuard | `endpoints[]` 中的 `type: wireguard` | `outbounds[]` 中的 `protocol: wireguard` |
+| 未命中规则 | `route.final: direct` | 第一个 outbound 为 direct |
+| 嗅探 | `route.rules` 的 `action: sniff` | 入站 `sniffing`，`routeOnly: true` |
+| 规则更新 | 原生 `update_interval: 1d` | cron 每日下载、转换、验证并重启 Xray |
+
+Xray 转换分别保留精确域名 `full:`、根域名及子域名 `domain:`、关键字 `keyword:`、正则 `regexp:`。sing-box 中以点开头的后缀（如 `.example.com`）仅匹配子域名，转换时使用转义后的正则，避免把 `example.com` 本身额外送入 WARP。
+
+两种内核都先根据请求中的域名或嗅探到的 HTTP Host/TLS SNI 选择出口。**原始目标为 IP 时保留该 IP**：即使命中 AI 并走 WARP，也不把嗅探域名替换为新的连接目标。只有原始目标为域名时才需要解析；WireGuard 模式下由对应的 WARP DNS 路径处理，SOCKS 模式下将域名交给已有的 WARP SOCKS 服务。没有请求域名且无法嗅探域名的 IP 流量无法命中这两组域名规则。
 
 ## 安装
 
@@ -48,6 +62,17 @@ agsbx res       # 重启
 
 首次安装后需重连 SSH，或使用 `bash "$HOME/bin/agsbx" check`。上游旧快捷脚本可通过仓库最新地址运行同名维护命令。
 
+已有部署更新本次规则转换修复时，先替换本地快捷脚本，再更新规则；这样每日 cron 也会使用新转换器：
+
+```bash
+mkdir -p "$HOME/bin"
+curl -fsSL https://raw.githubusercontent.com/weiweibunan/proxysh/main/argosbx.sh -o "$HOME/bin/agsbx.new" &&
+bash -n "$HOME/bin/agsbx.new" &&
+chmod 700 "$HOME/bin/agsbx.new" &&
+mv -f "$HOME/bin/agsbx.new" "$HOME/bin/agsbx" &&
+bash "$HOME/bin/agsbx" rules
+```
+
 更新下载或配置检查失败时保留原二进制；重启失败时尝试恢复 `.previous` 二进制和原配置。新配置生成失败会停止启动并保留错误，备份可用于手动恢复。升级并不等同于无人值守定期更新内核；内核仅在安装或执行更新命令时查询最新稳定版。
 
 可固定版本后再更新：
@@ -71,6 +96,14 @@ bash tests/test-routing.sh
 bash tests/test-releases.sh
 node scripts/build.cjs --check
 ```
+
+实际匹配行为验证（需要这两个官方内核的可执行文件）：
+
+```bash
+node tests/test-routing-behavior.cjs --xray /path/to/xray --singbox /path/to/sing-box
+```
+
+测试使用两个本地 SOCKS 记录出口选择，规则由生产模块生成；sing-box 使用同一 JSON 规则编译出的本地 SRS。测试不连接公网网站或真实 WARP，GitHub CI 也会运行该检查。
 
 规则源：
 
