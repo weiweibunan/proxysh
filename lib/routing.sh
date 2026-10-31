@@ -37,6 +37,69 @@ agsbx_validate_warp_json() {
     ' "$1" >/dev/null 2>&1
 }
 
+agsbx_reject_active_warp_identity() {
+    # Reusing an active system interface's identity would create a second peer
+    # session. Query only public identities; never print or persist another key.
+    local config=$1 public_key interface interface_key flags
+    [[ $(jq -r '.mode' "$config") == wireguard ]] || return 0
+    command -v wg >/dev/null 2>&1 || return 0
+    public_key=$(jq -r '.private_key' "$config" | wg pubkey 2>/dev/null) || return 0
+    [[ -n $public_key ]] || return 0
+    while read -r interface interface_key; do
+        if [[ -n $interface && $interface_key == "$public_key" ]]; then
+            # wg can also list a configured but administratively DOWN device.
+            if [[ $interface != */* && -r /sys/class/net/$interface/flags ]]; then
+                flags=$(cat "/sys/class/net/$interface/flags")
+                if [[ $flags =~ ^0x[0-9a-fA-F]+$ ]] && (( (flags & 1) == 0 )); then continue; fi
+            fi
+            agsbx_routing_error "WARP 身份已由系统 WireGuard 接口 $interface 使用。请设置 WARP_SOCKS 指向已有 WARP SOCKS 出口，或提供未运行的独立 WARP 配置。"
+            return 1
+        fi
+    done < <(wg show all public-key 2>/dev/null)
+}
+
+agsbx_shared_warp_enabled() {
+    local state
+    state=$(agsbx_state_dir)
+    [[ -f $state/xr.json && -f $state/sb.json && -s $state/warp.json ]] &&
+        jq -e '.mode == "wireguard"' "$state/warp.json" >/dev/null 2>&1
+}
+
+agsbx_shared_warp_port() {
+    # Called under the installer's flock. Persist the loopback-only bridge port
+    # so rule refreshes do not move an already running shared tunnel.
+    local state candidate='' saved file reserved attempt tmp owned
+    state=$(agsbx_state_dir)
+    mkdir -p "$state" || return 1
+    if [[ -s $state/warp-shared.port ]]; then candidate=$(cat "$state/warp-shared.port"); fi
+    for ((attempt=0; attempt<200; attempt++)); do
+        if [[ ! $candidate =~ ^[0-9]{4,5}$ ]] || ((10#$candidate < 10000 || 10#$candidate > 65535)); then
+            candidate=$(shuf -i 40000-59999 -n 1) || return 1
+        fi
+        candidate=$((10#$candidate))
+        reserved=false
+        for file in "$state"/port_*; do
+            [[ -f $file ]] || continue
+            saved=$(cat "$file")
+            if [[ $saved =~ (^|[^0-9])${candidate}([^0-9]|$) ]]; then reserved=true; break; fi
+        done
+        owned=false
+        if [[ -s $state/xr.json ]] && jq -e --argjson port "$candidate" \
+            'any(.inbounds[]?; .tag == "warp-shared-in" and .listen == "127.0.0.1" and .port == $port)' \
+            "$state/xr.json" >/dev/null 2>&1; then owned=true; fi
+        if [[ $reserved == false ]] && { [[ $owned == true ]] || ! ( : > "/dev/tcp/127.0.0.1/$candidate" ) 2>/dev/null; }; then
+            tmp=$(mktemp "$state/.warp-port.XXXXXX") || return 1
+            chmod 600 "$tmp" && printf '%s\n' "$candidate" > "$tmp" && mv -f "$tmp" "$state/warp-shared.port" || {
+                rm -f "$tmp"; return 1;
+            }
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+        candidate=''
+    done
+    agsbx_routing_error '无法分配 WARP 共享回环端口，请检查本机端口占用'
+}
+
 agsbx_prepare_warp() {
     local state profile='' candidate tmp raw endpoint
     state=$(agsbx_state_dir)
@@ -51,6 +114,7 @@ agsbx_prepare_warp() {
             if [[ -z $profile && -s $state/warp.json ]]; then
                 command -v jq >/dev/null || { agsbx_routing_error '需要 jq 才能读取 WARP 配置'; return 1; }
                 agsbx_validate_warp_json "$state/warp.json" || { agsbx_routing_error '已保存的 warp.json 无效，请设置 WARP_PROFILE'; return 1; }
+                agsbx_reject_active_warp_identity "$state/warp.json" || return 1
                 chmod 600 "$state/warp.json" || return 1
                 return 0
             fi
@@ -92,6 +156,7 @@ agsbx_prepare_warp() {
         ' > "$tmp" || { rm -f "$tmp"; agsbx_routing_error '无法解析 WireGuard 配置'; return 1; }
     fi
     agsbx_validate_warp_json "$tmp" || { rm -f "$tmp"; agsbx_routing_error 'WARP 密钥、地址或 reserved 字段无效'; return 1; }
+    agsbx_reject_active_warp_identity "$tmp" || { rm -f "$tmp"; return 1; }
     mv -f "$tmp" "$state/warp.json"
 }
 
@@ -149,20 +214,28 @@ agsbx_update_rules() {
 }
 
 agsbx_apply_routing() {
-    local core=$1 config=$2 state tmp
+    local core=$1 config=$2 state tmp shared=false shared_port=0
     state=$(agsbx_state_dir)
     agsbx_validate_warp_json "$state/warp.json" || { agsbx_routing_error '请先读取有效的 WARP 配置'; return 1; }
     [[ -s $config ]] || { agsbx_routing_error "配置不存在: $config"; return 1; }
+    if agsbx_shared_warp_enabled; then
+        shared=true
+        shared_port=$(agsbx_shared_warp_port) || return 1
+    fi
     tmp=$(mktemp "${config}.route.XXXXXX") || return 1
     chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
     if [[ $core == xray ]]; then
         if [[ ! -s $state/xray-ai-domains.json ]]; then
             agsbx_update_rules || { rm -f "$tmp"; return 1; }
         fi
-        jq --slurpfile wp "$state/warp.json" --slurpfile domains "$state/xray-ai-domains.json" '
+        jq --slurpfile wp "$state/warp.json" --slurpfile domains "$state/xray-ai-domains.json" \
+            --argjson shared "$shared" --argjson shared_port "$shared_port" '
           $wp[0] as $w |
           # Sniffed names select the route; routeOnly preserves an original IP target.
-          .inbounds |= map(.sniffing = {enabled:true,destOverride:["http","tls","quic"],metadataOnly:false,routeOnly:true}) |
+          .inbounds = ((.inbounds // []) | map(select(.tag != "warp-shared-in") |
+            .sniffing = {enabled:true,destOverride:["http","tls","quic"],metadataOnly:false,routeOnly:true})) |
+          if $shared then .inbounds += [{protocol:"socks",tag:"warp-shared-in",listen:"127.0.0.1",port:$shared_port,
+            settings:{auth:"noauth",udp:true,ip:"127.0.0.1"},sniffing:{enabled:false}}] else . end |
           .outbounds = [{protocol:"freedom",tag:"direct",settings:{}},
             (if $w.mode == "socks" then
               {protocol:"socks",tag:"warp-out",settings:{servers:[{address:$w.server,port:$w.server_port}]}}
@@ -171,16 +244,21 @@ agsbx_apply_routing() {
               peers:[{publicKey:$w.peer.public_key,preSharedKey:($w.peer.pre_shared_key // ""),allowedIPs:$w.peer.allowed_ips,keepAlive:25,
                 endpoint:((if $w.peer.host | contains(":") then "["+$w.peer.host+"]" else $w.peer.host end)+":"+($w.peer.port|tostring))}]}}
             end)] |
-          .routing = {domainStrategy:"AsIs",rules:[{type:"field",domain:$domains[0],outboundTag:"warp-out"}]} |
+          .routing = {domainStrategy:"AsIs",rules:
+            (if $shared then [{type:"field",inboundTag:["warp-shared-in"],outboundTag:"warp-out"}] else [] end) +
+            [{type:"field",domain:$domains[0],outboundTag:"warp-out"}]} |
           .dns = {servers:["localhost"]}
         ' "$config" > "$tmp" || { rm -f "$tmp"; return 1; }
     elif [[ $core == singbox ]]; then
-        jq --slurpfile wp "$state/warp.json" --arg state "$state" '
+        jq --slurpfile wp "$state/warp.json" --arg state "$state" \
+            --argjson shared "$shared" --argjson shared_port "$shared_port" '
           $wp[0] as $w |
           .outbounds = [{type:"direct",tag:"direct"}] |
           .endpoints = [] |
           if $w.mode == "socks" then
             .outbounds += [{type:"socks",tag:"warp-out",server:$w.server,server_port:$w.server_port,version:"5"}]
+          elif $shared then
+            .outbounds += [{type:"socks",tag:"warp-out",server:"127.0.0.1",server_port:$shared_port,version:"5"}]
           else .endpoints = [{type:"wireguard",tag:"warp-out",system:false,mtu:1280,address:$w.addresses,private_key:$w.private_key,
             peers:[{address:$w.peer.host,port:$w.peer.port,public_key:$w.peer.public_key,pre_shared_key:($w.peer.pre_shared_key // ""),allowed_ips:$w.peer.allowed_ips,
               persistent_keepalive_interval:25,reserved:$w.peer.reserved}]}] end |

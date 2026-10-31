@@ -21,6 +21,7 @@ jobs:
         run: |
           bash tests/test-routing.sh
           bash tests/test-releases.sh
+          bash tests/test-lifecycle.sh
       - name: Verify real core routing on loopback
         env:
           XRAY_VERSION: 26.10.29
@@ -34,3 +35,7 @@ jobs:
             --xray "$AGSBX_STATE_DIR/xray" \
             --singbox "$AGSBX_STATE_DIR/sing-box" \
             --temp-root "$RUNNER_TEMP"
+          node tests/test-routing-behavior.cjs \
+            --xray "$AGSBX_STATE_DIR/xray" \
+            --singbox "$AGSBX_STATE_DIR/sing-box" \
+            --temp-root "$RUNNER_TEMP" --shared true

@@ -1134,8 +1134,8 @@ elif command -v rc-service >/dev/null 2>&1 && [ "$EUID" -eq 0 ]; then
 cat > /etc/init.d/argo <<EOF
 #!/sbin/openrc-run
 description="argo service"
-command="${HOME}/agsbx/cloudflared tunnel"
-command_args="--no-autoupdate --edge-ip-version auto --protocol http2 run --token ${ARGO_AUTH}"
+command="${HOME}/agsbx/cloudflared"
+command_args="tunnel --no-autoupdate --edge-ip-version auto --protocol http2 run --token ${ARGO_AUTH}"
 pidfile="/run/argo.pid"
 command_background="yes"
 depend() {

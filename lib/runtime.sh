@@ -87,22 +87,72 @@ agsbx_restart_component() {
     kill -0 "$started_pid" 2>/dev/null
 }
 
+agsbx_reconcile_routes() {
+    # A WARP profile shared by both cores must be migrated as one topology:
+    # Xray owns WireGuard; sing-box reaches it through a loopback SOCKS gateway.
+    # Save all files before applying either side, and validate both before restart.
+    local stage core file config result=0 restart_phase=0
+    local cores=() files=()
+    stage=$(mktemp -d "$HOME/agsbx/.reconcile.XXXXXXXX") || return 1
+    for core in xray singbox; do
+        if [[ $core == xray ]]; then file=xr.json; else file=sb.json; fi
+        config="$HOME/agsbx/$file"
+        [[ -s $config ]] || continue
+        if ! cp -p "$config" "$stage/$file"; then rm -rf -- "$stage"; return 1; fi
+        cores+=("$core"); files+=("$file")
+    done
+    for core in "${cores[@]}"; do
+        if [[ $core == xray ]]; then file=xr.json; else file=sb.json; fi
+        if ! agsbx_apply_routing "$core" "$HOME/agsbx/$file"; then result=1; break; fi
+    done
+    if [[ $result == 0 ]]; then
+        for core in "${cores[@]}"; do
+            if [[ $core == xray ]]; then file=xr.json; else file=sb.json; fi
+            if ! agsbx_validate_config "$core" "$HOME/agsbx/$file"; then result=1; break; fi
+        done
+    fi
+    if [[ $result == 0 ]]; then
+        for core in "${cores[@]}"; do
+            restart_phase=1
+            if [[ $core == xray ]]; then
+                agsbx_restart_component xray || { result=1; break; }
+            else
+                agsbx_restart_component sing-box || { result=1; break; }
+            fi
+        done
+    fi
+    if [[ $result != 0 ]]; then
+        for file in "${files[@]}"; do
+            if ! mv -f "$stage/$file" "$HOME/agsbx/$file"; then
+                printf '配置恢复失败：%s，备份保留在 %s\n' "$file" "$stage" >&2
+                return 1
+            fi
+        done
+        if [[ $restart_phase == 1 ]]; then
+            for core in "${cores[@]}"; do
+                if [[ $core == xray ]]; then agsbx_restart_component xray || true
+                else agsbx_restart_component sing-box || true; fi
+            done
+        fi
+        printf '分流配置更新失败，已恢复原配置。\n' >&2
+    fi
+    rm -rf -- "$stage"
+    return "$result"
+}
+
 agsbx_refresh_rules() {
     agsbx_prepare_warp || return 1
     agsbx_update_rules || return 1
-    [[ -f "$HOME/agsbx/xr.json" ]] || return 0
-    local backup
-    backup=$(mktemp "$HOME/agsbx/.rules-backup.XXXXXXXX") || return 1
-    cp -p "$HOME/agsbx/xr.json" "$backup" || return 1
-    if ! agsbx_apply_routing xray "$HOME/agsbx/xr.json" || ! agsbx_validate_config xray "$HOME/agsbx/xr.json"; then
-        mv -f "$backup" "$HOME/agsbx/xr.json"
-        return 1
-    fi
-    if agsbx_restart_component xray; then rm -f "$backup"; else
-        mv -f "$backup" "$HOME/agsbx/xr.json"
-        agsbx_restart_component xray || true
-        return 1
-    fi
+    agsbx_reconcile_routes
+}
+
+agsbx_shared_topology_missing() {
+    [[ -s "$HOME/agsbx/xr.json" && -s "$HOME/agsbx/sb.json" && -s "$HOME/agsbx/warp.json" ]] || return 1
+    jq -e '.mode == "wireguard"' "$HOME/agsbx/warp.json" >/dev/null 2>&1 || return 1
+    # Reconfiguring a single core while its sibling still owns the same WG key
+    # can leave sing-box pointed at a gateway that the running Xray lacks.
+    if ! jq -e 'any(.inbounds[]?; .tag == "warp-shared-in")' "$HOME/agsbx/xr.json" >/dev/null 2>&1; then return 0; fi
+    jq -e 'any(.endpoints[]?; .type == "wireguard" and .tag == "warp-out")' "$HOME/agsbx/sb.json" >/dev/null 2>&1
 }
 
 agsbx_install_rule_schedule() {
@@ -136,6 +186,10 @@ agsbx_upgrade() {
     case "$component" in xray) core=xray; config="$HOME/agsbx/xr.json" ;; sing-box) core=singbox; config="$HOME/agsbx/sb.json" ;; esac
     if [[ -n "$config" && -s "$config" ]]; then
         agsbx_prepare_warp || return 1
+        if agsbx_shared_topology_missing; then
+            printf '检测到双内核旧 WARP 拓扑，请先运行 agsbx rules 迁移共享出口，再更新内核。\n' >&2
+            return 1
+        fi
         backup=$(mktemp "$HOME/agsbx/.upgrade-config.XXXXXXXX") || return 1
         cp -p "$config" "$backup" || return 1
         if ! agsbx_apply_routing "$core" "$config"; then mv -f "$backup" "$config"; return 1; fi

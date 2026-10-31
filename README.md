@@ -7,12 +7,16 @@
 - **组件更新**：安装及更新时动态查询 SagerNet/sing-box、XTLS/Xray-core、cloudflare/cloudflared 官方最新稳定发布，排除预发布版本。下载后校验官方 GitHub SHA256 摘要，检查二进制版本和配置后才替换。
 - **WARP 凭据**：读取服务器已有的 WireGuard 配置，或使用已有 WARP SOCKS 服务。没有共享密钥，不自动注册账号。凭据只保存在服务器，不上传 GitHub。
 
+同时启用两个内核并导入同一份 WireGuard 配置时，**仅 Xray 建立 WARP 隧道**，sing-box 通过 Xray 的 `127.0.0.1` SOCKS 网关共享它，避免同一 WARP 身份建立两个独立 WireGuard 会话。该内部端口自动选择、保存在 `warp-shared.port`，只监听本机，不需要开放公网端口。只启用一个内核时由该内核建立隧道；设置 `WARP_SOCKS` 时两个内核都使用指定的现有 SOCKS 服务。
+
+导入的身份不应同时被系统的 WireGuard 接口使用。若系统提供 `wg` 且能读取接口公钥，脚本会检查并拒绝复用已运行接口的身份；无法读取时不能自动识别。已有活动系统 WARP 应使用其 SOCKS 出口，或提供一份独立且未运行的 WARP 配置，脚本不会停止系统隧道。
+
 ## 两个内核的实现区别
 
 | 项目 | sing-box | Xray |
 | --- | --- | --- |
 | 域名规则 | `route.rule_set` 远程 `.srs` | 从同源 `.json` 转成 `routing.rules[].domain`，不读取 `.srs` |
-| WARP WireGuard | `endpoints[]` 中的 `type: wireguard` | `outbounds[]` 中的 `protocol: wireguard` |
+| WARP WireGuard | 单内核时使用 WireGuard endpoint；双内核时使用 Xray 本机 SOCKS 网关 | `outbounds[]` 中的 `protocol: wireguard`；双内核时提供共享网关 |
 | 未命中规则 | `route.final: direct` | 第一个 outbound 为 direct |
 | 嗅探 | `route.rules` 的 `action: sniff` | 入站 `sniffing`，`routeOnly: true` |
 | 规则更新 | 原生 `update_interval: 1d` | cron 每日下载、转换、验证并重启 Xray |
@@ -51,7 +55,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/weiweibunan/proxysh/main/arg
 
 ```bash
 agsbx check     # 用已安装内核检查配置
-agsbx rules     # 刷新 OpenAI/Gemini 规则并验证、重启 Xray
+agsbx rules     # 刷新规则，协调验证两份配置并重启；可迁移旧双 WG 布局
 agsbx upx       # 更新 Xray 官方稳定版
 agsbx ups       # 更新 sing-box 官方稳定版
 agsbx upa       # 更新 cloudflared 官方稳定版
@@ -72,6 +76,8 @@ chmod 700 "$HOME/bin/agsbx.new" &&
 mv -f "$HOME/bin/agsbx.new" "$HOME/bin/agsbx" &&
 bash "$HOME/bin/agsbx" rules
 ```
+
+双内核迁移或规则更新时，先备份和生成两份配置，全部验证通过后按 Xray → sing-box 顺序重启。失败恢复原配置；旧双 WireGuard 布局会阻止单内核升级，提示先运行 `agsbx rules`。旧内核无法验证新配置时，使用原协议变量执行 `rep` 重新安装最新内核。
 
 更新下载或配置检查失败时保留原二进制；重启失败时尝试恢复 `.previous` 二进制和原配置。新配置生成失败会停止启动并保留错误，备份可用于手动恢复。升级并不等同于无人值守定期更新内核；内核仅在安装或执行更新命令时查询最新稳定版。
 
@@ -94,6 +100,7 @@ node scripts/build.cjs
 bash -n argosbx.sh
 bash tests/test-routing.sh
 bash tests/test-releases.sh
+bash tests/test-lifecycle.sh
 node scripts/build.cjs --check
 ```
 
@@ -101,6 +108,7 @@ node scripts/build.cjs --check
 
 ```bash
 node tests/test-routing-behavior.cjs --xray /path/to/xray --singbox /path/to/sing-box
+node tests/test-routing-behavior.cjs --xray /path/to/xray --singbox /path/to/sing-box --shared true
 ```
 
 测试使用两个本地 SOCKS 记录出口选择，规则由生产模块生成；sing-box 使用同一 JSON 规则编译出的本地 SRS。测试不连接公网网站或真实 WARP，GitHub CI 也会运行该检查。

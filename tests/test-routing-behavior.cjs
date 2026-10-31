@@ -1,7 +1,7 @@
 // Real-core, loopback-only tests of generated routing matchers and sniffed targets.
 // Only transport endpoints, local DNS, and rule-set download locations are replaced.
 // Usage: node tests/test-routing-behavior.cjs --xray PATH --singbox PATH
-//        [--bash PATH] [--jq-dir PATH] [--temp-root PATH]
+//        [--bash PATH] [--jq-dir PATH] [--temp-root PATH] [--shared true]
 const fs = require('node:fs');
 const path = require('node:path');
 const net = require('node:net');
@@ -114,6 +114,83 @@ function runSync(binary, args, extra = {}) {
   const result = spawnSync(binary, args, { cwd: repoDir, encoding: 'utf8', windowsHide: true, ...extra });
   if (result.status !== 0) throw Error(`Command failed: ${binary} ${args.join(' ')}\n${result.stdout || ''}${result.stderr || ''}${result.error || ''}`);
 }
+function localizeSing(config, dnsPort) {
+  config.dns.servers = config.dns.servers.map(server => ({ type: 'tcp', tag: server.tag, server: '127.0.0.1', server_port: dnsPort }));
+  config.route.rule_set = config.route.rule_set.map(rule => ({ type: 'local', tag: rule.tag, format: 'binary', path: path.join(testDir, rule.tag === 'geosite-openai' ? 'openai.srs' : 'google-gemini.srs').replaceAll('\\', '/') }));
+}
+function socksOutbound(core, tag, port) {
+  return core === 'xray'
+    ? { protocol: 'socks', tag, settings: { servers: [{ address: '127.0.0.1', port }] } }
+    : { type: 'socks', tag, server: '127.0.0.1', server_port: port, version: '5' };
+}
+function assertShared(description, condition) {
+  assertions++;
+  if (!condition) { failures++; console.log(`not ok ${assertions} - shared: ${description}`); return; }
+  console.log(`ok ${assertions} - shared: ${description}`);
+}
+function startCore(binary, configPath, name) {
+  let log = '';
+  const child = spawn(binary, ['run', '-c', configPath], { cwd: testDir, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  children.push(child);
+  child.stdout.on('data', d => { log += d; }); child.stderr.on('data', d => { log += d; });
+  return { child, saveLog() { fs.writeFileSync(path.join(testDir, name + '.log'), log); } };
+}
+async function testSharedCores(directPort, warpPort, dnsPort) {
+  const xray = JSON.parse(fs.readFileSync(path.join(testDir, 'xray.json'), 'utf8'));
+  const sing = JSON.parse(fs.readFileSync(path.join(testDir, 'singbox.json'), 'utf8'));
+  const bridge = xray.inbounds.find(i => i.tag === 'warp-shared-in');
+  const forced = xray.routing.rules[0];
+  const relay = sing.outbounds.find(o => o.tag === 'warp-out');
+  assertShared('exactly one WireGuard owner across both generated configs',
+    xray.outbounds.filter(o => o.protocol === 'wireguard').length === 1 &&
+    (sing.endpoints || []).filter(o => o.type === 'wireguard').length === 0 &&
+    sing.outbounds.filter(o => o.type === 'wireguard').length === 0);
+  assertShared('Xray shared gateway listens only on loopback', bridge && bridge.listen === '127.0.0.1' && bridge.protocol === 'socks');
+  assertShared('shared gateway traffic is forced through the owner WARP outbound',
+    forced.outboundTag === 'warp-out' && forced.inboundTag.includes('warp-shared-in'));
+  assertShared('sing-box relay targets the actual Xray gateway',
+    relay.type === 'socks' && relay.server === '127.0.0.1' && relay.server_port === bridge.port);
+  if (failures) throw Error('Shared production topology is invalid');
+  localizeSing(sing, dnsPort);
+  const nativeXrayPath = path.join(testDir, 'shared-xray.native.json'), nativeSingPath = path.join(testDir, 'shared-singbox.native.json');
+  fs.writeFileSync(nativeXrayPath, JSON.stringify(xray)); fs.writeFileSync(nativeSingPath, JSON.stringify(sing));
+  runSync(path.resolve(options.xray), ['run', '-test', '-c', nativeXrayPath]); assertShared('official Xray accepts production shared topology', true);
+  runSync(path.resolve(options.singbox), ['check', '-c', nativeSingPath]); assertShared('official sing-box accepts production shared topology', true);
+  const xrayPort = await reservePort(), singPort = await reservePort();
+  xray.inbounds.find(i => i.tag === 'fixture-in').port = xrayPort;
+  sing.inbounds.find(i => i.tag === 'fixture-in').listen_port = singPort;
+  xray.log = { loglevel: 'warning' }; sing.log = { level: 'warn' };
+  // Replace only the owner's final WG transport with a local marker; the
+  // sing-box WARP relay still traverses the real running Xray gateway.
+  xray.outbounds = xray.outbounds.map(out => socksOutbound('xray', out.tag, out.tag === 'direct' ? directPort : warpPort));
+  sing.outbounds = sing.outbounds.map(out => out.tag === 'direct' ? socksOutbound('singbox', out.tag, directPort) : out);
+  const xrayPath = path.join(testDir, 'shared-xray.run.json'), singPath = path.join(testDir, 'shared-singbox.run.json');
+  fs.writeFileSync(xrayPath, JSON.stringify(xray)); fs.writeFileSync(singPath, JSON.stringify(sing));
+  const owner = startCore(path.resolve(options.xray), xrayPath, 'shared-xray');
+  const relayCore = startCore(path.resolve(options.singbox), singPath, 'shared-singbox');
+  try {
+    await waitReady(xrayPort, owner.child); await waitReady(bridge.port, owner.child); await waitReady(singPort, relayCore.child);
+    const cases = [
+      ['OpenAI domain', 'api.openai.com', 'warp'],
+      ['Gemini domain', 'gemini.google.com', 'warp'],
+      ['ordinary Google remains direct', 'www.google.com', 'direct'],
+      ['HTTP Host selects shared WARP and preserves IP', 'api.openai.com', 'warp', '203.0.113.10', 'http'],
+      ['TLS SNI selects shared WARP and preserves IP', 'api.openai.com', 'warp', '203.0.113.10', 'tls']
+    ];
+    for (const [core, port] of [['xray', xrayPort], ['singbox', singPort]]) {
+      for (const [description, hostname, route, target, mode] of cases) {
+        records.length = 0; assertions++;
+        try {
+          const body = await sendRequest(port, hostname, target, mode);
+          const record = records.at(-1), expectedTarget = target || (route === 'warp' ? hostname : undefined);
+          if (!record || record.route !== route || (mode !== 'tls' && !body.endsWith(route)) || (expectedTarget && record.target !== expectedTarget))
+            throw Error(`expected ${route}${expectedTarget ? ' to ' + expectedTarget : ''}, observed ${JSON.stringify(record)}`);
+          console.log(`ok ${assertions} - shared ${core}: ${description} (${record.route}, ${record.target})`);
+        } catch (error) { failures++; console.log(`not ok ${assertions} - shared ${core}: ${description}: ${error.message}`); }
+      }
+    }
+  } finally { owner.child.kill(); relayCore.child.kill(); owner.saveLog(); relayCore.saveLog(); }
+}
 async function testCore(name, binary, directPort, warpPort, dnsPort) {
   const configPath = path.join(testDir, name + '.json'); const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
   const inboundPort = await reservePort();
@@ -162,10 +239,13 @@ async function testCore(name, binary, directPort, warpPort, dnsPort) {
 (async () => {
   try {
     const directPort = await markerProxy('direct'), warpPort = await markerProxy('warp'), dnsPort = await dnsStub();
-    runSync(options.bash || 'bash', [path.join(repoDir, 'tests/fixture-routing-configs.sh'), testDir.replaceAll('\\', '/'), String(warpPort)], { env: { ...process.env, AGSBX_TEST_JQ_DIR: options['jq-dir'] || '' } });
+    runSync(options.bash || 'bash', [path.join(repoDir, 'tests/fixture-routing-configs.sh'), testDir.replaceAll('\\', '/'), String(warpPort)], { env: { ...process.env, AGSBX_TEST_JQ_DIR: options['jq-dir'] ? path.resolve(options['jq-dir']) : '', AGSBX_TEST_SHARED: options.shared === 'true' ? '1' : '0' } });
     for (const category of ['openai', 'google-gemini']) runSync(path.resolve(options.singbox), ['rule-set', 'compile', path.join(testDir, category + '.json'), '-o', path.join(testDir, category + '.srs')]);
-    if (!options.core || options.core === 'xray') await testCore('xray', path.resolve(options.xray), directPort, warpPort, dnsPort);
-    if (!options.core || options.core === 'singbox') await testCore('singbox', path.resolve(options.singbox), directPort, warpPort, dnsPort);
+    if (options.shared === 'true') await testSharedCores(directPort, warpPort, dnsPort);
+    else {
+      if (!options.core || options.core === 'xray') await testCore('xray', path.resolve(options.xray), directPort, warpPort, dnsPort);
+      if (!options.core || options.core === 'singbox') await testCore('singbox', path.resolve(options.singbox), directPort, warpPort, dnsPort);
+    }
     console.log(`${failures ? 'FAIL' : 'PASS'}: ${assertions} real-core routing assertions, ${failures} failed`);
     if (failures) { console.log('Failure fixtures: ' + testDir); process.exitCode = 1; }
   } catch (error) { console.error(error.stack); console.error('Failure fixtures: ' + testDir); failures++; process.exitCode = 1; }

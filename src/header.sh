@@ -3,7 +3,7 @@
 AGSBX_REPO=weiweibunan/proxysh
 AGSBX_REF=main
 AGSBX_URL="https://raw.githubusercontent.com/$AGSBX_REPO/$AGSBX_REF/argosbx.sh"
-AGSBX_VERSION=2026.10.31-r2
+AGSBX_VERSION=2026.10.31-r3
 umask 077
 
 agsbx_usage() {

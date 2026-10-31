@@ -8,7 +8,7 @@
 AGSBX_REPO=weiweibunan/proxysh
 AGSBX_REF=main
 AGSBX_URL="https://raw.githubusercontent.com/$AGSBX_REPO/$AGSBX_REF/argosbx.sh"
-AGSBX_VERSION=2026.10.31-r2
+AGSBX_VERSION=2026.10.31-r3
 umask 077
 
 agsbx_usage() {
@@ -226,6 +226,69 @@ agsbx_validate_warp_json() {
     ' "$1" >/dev/null 2>&1
 }
 
+agsbx_reject_active_warp_identity() {
+    # Reusing an active system interface's identity would create a second peer
+    # session. Query only public identities; never print or persist another key.
+    local config=$1 public_key interface interface_key flags
+    [[ $(jq -r '.mode' "$config") == wireguard ]] || return 0
+    command -v wg >/dev/null 2>&1 || return 0
+    public_key=$(jq -r '.private_key' "$config" | wg pubkey 2>/dev/null) || return 0
+    [[ -n $public_key ]] || return 0
+    while read -r interface interface_key; do
+        if [[ -n $interface && $interface_key == "$public_key" ]]; then
+            # wg can also list a configured but administratively DOWN device.
+            if [[ $interface != */* && -r /sys/class/net/$interface/flags ]]; then
+                flags=$(cat "/sys/class/net/$interface/flags")
+                if [[ $flags =~ ^0x[0-9a-fA-F]+$ ]] && (( (flags & 1) == 0 )); then continue; fi
+            fi
+            agsbx_routing_error "WARP 身份已由系统 WireGuard 接口 $interface 使用。请设置 WARP_SOCKS 指向已有 WARP SOCKS 出口，或提供未运行的独立 WARP 配置。"
+            return 1
+        fi
+    done < <(wg show all public-key 2>/dev/null)
+}
+
+agsbx_shared_warp_enabled() {
+    local state
+    state=$(agsbx_state_dir)
+    [[ -f $state/xr.json && -f $state/sb.json && -s $state/warp.json ]] &&
+        jq -e '.mode == "wireguard"' "$state/warp.json" >/dev/null 2>&1
+}
+
+agsbx_shared_warp_port() {
+    # Called under the installer's flock. Persist the loopback-only bridge port
+    # so rule refreshes do not move an already running shared tunnel.
+    local state candidate='' saved file reserved attempt tmp owned
+    state=$(agsbx_state_dir)
+    mkdir -p "$state" || return 1
+    if [[ -s $state/warp-shared.port ]]; then candidate=$(cat "$state/warp-shared.port"); fi
+    for ((attempt=0; attempt<200; attempt++)); do
+        if [[ ! $candidate =~ ^[0-9]{4,5}$ ]] || ((10#$candidate < 10000 || 10#$candidate > 65535)); then
+            candidate=$(shuf -i 40000-59999 -n 1) || return 1
+        fi
+        candidate=$((10#$candidate))
+        reserved=false
+        for file in "$state"/port_*; do
+            [[ -f $file ]] || continue
+            saved=$(cat "$file")
+            if [[ $saved =~ (^|[^0-9])${candidate}([^0-9]|$) ]]; then reserved=true; break; fi
+        done
+        owned=false
+        if [[ -s $state/xr.json ]] && jq -e --argjson port "$candidate" \
+            'any(.inbounds[]?; .tag == "warp-shared-in" and .listen == "127.0.0.1" and .port == $port)' \
+            "$state/xr.json" >/dev/null 2>&1; then owned=true; fi
+        if [[ $reserved == false ]] && { [[ $owned == true ]] || ! ( : > "/dev/tcp/127.0.0.1/$candidate" ) 2>/dev/null; }; then
+            tmp=$(mktemp "$state/.warp-port.XXXXXX") || return 1
+            chmod 600 "$tmp" && printf '%s\n' "$candidate" > "$tmp" && mv -f "$tmp" "$state/warp-shared.port" || {
+                rm -f "$tmp"; return 1;
+            }
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+        candidate=''
+    done
+    agsbx_routing_error '无法分配 WARP 共享回环端口，请检查本机端口占用'
+}
+
 agsbx_prepare_warp() {
     local state profile='' candidate tmp raw endpoint
     state=$(agsbx_state_dir)
@@ -240,6 +303,7 @@ agsbx_prepare_warp() {
             if [[ -z $profile && -s $state/warp.json ]]; then
                 command -v jq >/dev/null || { agsbx_routing_error '需要 jq 才能读取 WARP 配置'; return 1; }
                 agsbx_validate_warp_json "$state/warp.json" || { agsbx_routing_error '已保存的 warp.json 无效，请设置 WARP_PROFILE'; return 1; }
+                agsbx_reject_active_warp_identity "$state/warp.json" || return 1
                 chmod 600 "$state/warp.json" || return 1
                 return 0
             fi
@@ -281,6 +345,7 @@ agsbx_prepare_warp() {
         ' > "$tmp" || { rm -f "$tmp"; agsbx_routing_error '无法解析 WireGuard 配置'; return 1; }
     fi
     agsbx_validate_warp_json "$tmp" || { rm -f "$tmp"; agsbx_routing_error 'WARP 密钥、地址或 reserved 字段无效'; return 1; }
+    agsbx_reject_active_warp_identity "$tmp" || { rm -f "$tmp"; return 1; }
     mv -f "$tmp" "$state/warp.json"
 }
 
@@ -338,20 +403,28 @@ agsbx_update_rules() {
 }
 
 agsbx_apply_routing() {
-    local core=$1 config=$2 state tmp
+    local core=$1 config=$2 state tmp shared=false shared_port=0
     state=$(agsbx_state_dir)
     agsbx_validate_warp_json "$state/warp.json" || { agsbx_routing_error '请先读取有效的 WARP 配置'; return 1; }
     [[ -s $config ]] || { agsbx_routing_error "配置不存在: $config"; return 1; }
+    if agsbx_shared_warp_enabled; then
+        shared=true
+        shared_port=$(agsbx_shared_warp_port) || return 1
+    fi
     tmp=$(mktemp "${config}.route.XXXXXX") || return 1
     chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
     if [[ $core == xray ]]; then
         if [[ ! -s $state/xray-ai-domains.json ]]; then
             agsbx_update_rules || { rm -f "$tmp"; return 1; }
         fi
-        jq --slurpfile wp "$state/warp.json" --slurpfile domains "$state/xray-ai-domains.json" '
+        jq --slurpfile wp "$state/warp.json" --slurpfile domains "$state/xray-ai-domains.json" \
+            --argjson shared "$shared" --argjson shared_port "$shared_port" '
           $wp[0] as $w |
           # Sniffed names select the route; routeOnly preserves an original IP target.
-          .inbounds |= map(.sniffing = {enabled:true,destOverride:["http","tls","quic"],metadataOnly:false,routeOnly:true}) |
+          .inbounds = ((.inbounds // []) | map(select(.tag != "warp-shared-in") |
+            .sniffing = {enabled:true,destOverride:["http","tls","quic"],metadataOnly:false,routeOnly:true})) |
+          if $shared then .inbounds += [{protocol:"socks",tag:"warp-shared-in",listen:"127.0.0.1",port:$shared_port,
+            settings:{auth:"noauth",udp:true,ip:"127.0.0.1"},sniffing:{enabled:false}}] else . end |
           .outbounds = [{protocol:"freedom",tag:"direct",settings:{}},
             (if $w.mode == "socks" then
               {protocol:"socks",tag:"warp-out",settings:{servers:[{address:$w.server,port:$w.server_port}]}}
@@ -360,16 +433,21 @@ agsbx_apply_routing() {
               peers:[{publicKey:$w.peer.public_key,preSharedKey:($w.peer.pre_shared_key // ""),allowedIPs:$w.peer.allowed_ips,keepAlive:25,
                 endpoint:((if $w.peer.host | contains(":") then "["+$w.peer.host+"]" else $w.peer.host end)+":"+($w.peer.port|tostring))}]}}
             end)] |
-          .routing = {domainStrategy:"AsIs",rules:[{type:"field",domain:$domains[0],outboundTag:"warp-out"}]} |
+          .routing = {domainStrategy:"AsIs",rules:
+            (if $shared then [{type:"field",inboundTag:["warp-shared-in"],outboundTag:"warp-out"}] else [] end) +
+            [{type:"field",domain:$domains[0],outboundTag:"warp-out"}]} |
           .dns = {servers:["localhost"]}
         ' "$config" > "$tmp" || { rm -f "$tmp"; return 1; }
     elif [[ $core == singbox ]]; then
-        jq --slurpfile wp "$state/warp.json" --arg state "$state" '
+        jq --slurpfile wp "$state/warp.json" --arg state "$state" \
+            --argjson shared "$shared" --argjson shared_port "$shared_port" '
           $wp[0] as $w |
           .outbounds = [{type:"direct",tag:"direct"}] |
           .endpoints = [] |
           if $w.mode == "socks" then
             .outbounds += [{type:"socks",tag:"warp-out",server:$w.server,server_port:$w.server_port,version:"5"}]
+          elif $shared then
+            .outbounds += [{type:"socks",tag:"warp-out",server:"127.0.0.1",server_port:$shared_port,version:"5"}]
           else .endpoints = [{type:"wireguard",tag:"warp-out",system:false,mtu:1280,address:$w.addresses,private_key:$w.private_key,
             peers:[{address:$w.peer.host,port:$w.peer.port,public_key:$w.peer.public_key,pre_shared_key:($w.peer.pre_shared_key // ""),allowed_ips:$w.peer.allowed_ips,
               persistent_keepalive_interval:25,reserved:$w.peer.reserved}]}] end |
@@ -480,22 +558,72 @@ agsbx_restart_component() {
     kill -0 "$started_pid" 2>/dev/null
 }
 
+agsbx_reconcile_routes() {
+    # A WARP profile shared by both cores must be migrated as one topology:
+    # Xray owns WireGuard; sing-box reaches it through a loopback SOCKS gateway.
+    # Save all files before applying either side, and validate both before restart.
+    local stage core file config result=0 restart_phase=0
+    local cores=() files=()
+    stage=$(mktemp -d "$HOME/agsbx/.reconcile.XXXXXXXX") || return 1
+    for core in xray singbox; do
+        if [[ $core == xray ]]; then file=xr.json; else file=sb.json; fi
+        config="$HOME/agsbx/$file"
+        [[ -s $config ]] || continue
+        if ! cp -p "$config" "$stage/$file"; then rm -rf -- "$stage"; return 1; fi
+        cores+=("$core"); files+=("$file")
+    done
+    for core in "${cores[@]}"; do
+        if [[ $core == xray ]]; then file=xr.json; else file=sb.json; fi
+        if ! agsbx_apply_routing "$core" "$HOME/agsbx/$file"; then result=1; break; fi
+    done
+    if [[ $result == 0 ]]; then
+        for core in "${cores[@]}"; do
+            if [[ $core == xray ]]; then file=xr.json; else file=sb.json; fi
+            if ! agsbx_validate_config "$core" "$HOME/agsbx/$file"; then result=1; break; fi
+        done
+    fi
+    if [[ $result == 0 ]]; then
+        for core in "${cores[@]}"; do
+            restart_phase=1
+            if [[ $core == xray ]]; then
+                agsbx_restart_component xray || { result=1; break; }
+            else
+                agsbx_restart_component sing-box || { result=1; break; }
+            fi
+        done
+    fi
+    if [[ $result != 0 ]]; then
+        for file in "${files[@]}"; do
+            if ! mv -f "$stage/$file" "$HOME/agsbx/$file"; then
+                printf '配置恢复失败：%s，备份保留在 %s\n' "$file" "$stage" >&2
+                return 1
+            fi
+        done
+        if [[ $restart_phase == 1 ]]; then
+            for core in "${cores[@]}"; do
+                if [[ $core == xray ]]; then agsbx_restart_component xray || true
+                else agsbx_restart_component sing-box || true; fi
+            done
+        fi
+        printf '分流配置更新失败，已恢复原配置。\n' >&2
+    fi
+    rm -rf -- "$stage"
+    return "$result"
+}
+
 agsbx_refresh_rules() {
     agsbx_prepare_warp || return 1
     agsbx_update_rules || return 1
-    [[ -f "$HOME/agsbx/xr.json" ]] || return 0
-    local backup
-    backup=$(mktemp "$HOME/agsbx/.rules-backup.XXXXXXXX") || return 1
-    cp -p "$HOME/agsbx/xr.json" "$backup" || return 1
-    if ! agsbx_apply_routing xray "$HOME/agsbx/xr.json" || ! agsbx_validate_config xray "$HOME/agsbx/xr.json"; then
-        mv -f "$backup" "$HOME/agsbx/xr.json"
-        return 1
-    fi
-    if agsbx_restart_component xray; then rm -f "$backup"; else
-        mv -f "$backup" "$HOME/agsbx/xr.json"
-        agsbx_restart_component xray || true
-        return 1
-    fi
+    agsbx_reconcile_routes
+}
+
+agsbx_shared_topology_missing() {
+    [[ -s "$HOME/agsbx/xr.json" && -s "$HOME/agsbx/sb.json" && -s "$HOME/agsbx/warp.json" ]] || return 1
+    jq -e '.mode == "wireguard"' "$HOME/agsbx/warp.json" >/dev/null 2>&1 || return 1
+    # Reconfiguring a single core while its sibling still owns the same WG key
+    # can leave sing-box pointed at a gateway that the running Xray lacks.
+    if ! jq -e 'any(.inbounds[]?; .tag == "warp-shared-in")' "$HOME/agsbx/xr.json" >/dev/null 2>&1; then return 0; fi
+    jq -e 'any(.endpoints[]?; .type == "wireguard" and .tag == "warp-out")' "$HOME/agsbx/sb.json" >/dev/null 2>&1
 }
 
 agsbx_install_rule_schedule() {
@@ -529,6 +657,10 @@ agsbx_upgrade() {
     case "$component" in xray) core=xray; config="$HOME/agsbx/xr.json" ;; sing-box) core=singbox; config="$HOME/agsbx/sb.json" ;; esac
     if [[ -n "$config" && -s "$config" ]]; then
         agsbx_prepare_warp || return 1
+        if agsbx_shared_topology_missing; then
+            printf '检测到双内核旧 WARP 拓扑，请先运行 agsbx rules 迁移共享出口，再更新内核。\n' >&2
+            return 1
+        fi
         backup=$(mktemp "$HOME/agsbx/.upgrade-config.XXXXXXXX") || return 1
         cp -p "$config" "$backup" || return 1
         if ! agsbx_apply_routing "$core" "$config"; then mv -f "$backup" "$config"; return 1; fi
@@ -1727,8 +1859,8 @@ elif command -v rc-service >/dev/null 2>&1 && [ "$EUID" -eq 0 ]; then
 cat > /etc/init.d/argo <<EOF
 #!/sbin/openrc-run
 description="argo service"
-command="${HOME}/agsbx/cloudflared tunnel"
-command_args="--no-autoupdate --edge-ip-version auto --protocol http2 run --token ${ARGO_AUTH}"
+command="${HOME}/agsbx/cloudflared"
+command_args="tunnel --no-autoupdate --edge-ip-version auto --protocol http2 run --token ${ARGO_AUTH}"
 pidfile="/run/argo.pid"
 command_background="yes"
 depend() {

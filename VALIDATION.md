@@ -26,3 +26,14 @@
 限制：没有执行 Linux 上的完整安装、systemd/OpenRC 生命周期和真实 WARP 出口连通性测试；Windows 不验证 POSIX 权限位。Xray 对上游保留的 VMess/WebSocket 和 Reality 默认目标打印兼容性提醒，配置检查结果仍为通过。cloudflared 的更新流程经过模拟资产测试，本地未建立真实 Cloudflare 隧道。
 
 官方版本来源：[sing-box 1.14.4](https://github.com/SagerNet/sing-box/releases/tag/v1.14.4)、[Xray 26.10.29](https://github.com/XTLS/Xray-core/releases/tag/v26.10.29)、[cloudflared 2026.10.7](https://github.com/cloudflare/cloudflared/releases/tag/2026.10.7)。
+
+## r3：部署前隔离模拟
+
+- 用户原命令的 13 个协议变量全部生成并通过官方内核配置检查。使用固定测试端口和有效测试证书；真实安装仍随机选择空端口，证书需在 VPS 申请或提供。
+- 发现双内核各自导入同一 WireGuard 身份的设计风险。WireGuard 的同一对端身份会更新其回包 endpoint，依据见 [WireGuard roaming](https://www.wireguard.com/#built-in-roaming)。这不是已经实测的 Cloudflare 故障。
+- 已改成双内核共用一个隧道：Xray 持有唯一 WireGuard 出站，sing-box 连接仅监听 `127.0.0.1` 的 Xray SOCKS 网关。全协议生成配置已核对只存在一个 WireGuard 拥有者。
+- 两个真实内核并行运行的共享链路模拟：**16 项通过**；独立路由原有 **30 项通过**。共享测试仅将最终 WireGuard 传输替换为本机记录出口，保留真实的 sing-box → Xray 网关链路、路由及嗅探。
+- 生命周期隔离模拟：**15 项通过**，覆盖下载/转换/配置检查失败不重启、二进制/版本/配置回退、两个配置的协调迁移、重启次序、缺失 WARP 阻断及旧双 WG 布局升级保护。只在被加载的测试副本中重定向状态路径，没有改写 HOME 或操作系统服务。
+- 官方发布更新模块原有 **7 项检查通过**。活动系统 WireGuard 同身份拒绝、不同身份接受的模拟通过。
+
+没有执行 VPS 完整安装；本机没有可用的已运行 Linux Docker 引擎。GitHub CI 会在 Linux 上运行同一组流量及生命周期测试。实际 WARP 握手、Cloudflare 隧道、ACME 签发、系统服务开机启动和 VPS/云安全组外部端口可达性仍需在 VPS 验证。
