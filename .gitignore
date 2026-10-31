@@ -1,0 +1,6 @@
+*.key
+*.conf
+warp.json
+wgcf-account.toml
+*.previous
+*.log

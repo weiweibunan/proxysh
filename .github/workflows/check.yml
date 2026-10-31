@@ -1,0 +1,23 @@
+name: Validate installer
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check generated installer and Bash syntax
+        run: |
+          node scripts/build.cjs --check
+          bash -n argosbx.sh
+          for source in lib/*.sh src/*.sh tests/*.sh; do bash -n "$source"; done
+      - name: Offline regression tests
+        run: |
+          bash tests/test-routing.sh
+          bash tests/test-releases.sh
